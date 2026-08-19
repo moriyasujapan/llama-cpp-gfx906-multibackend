@@ -1,0 +1,78 @@
+# AtomicBot-ai/atomic-llama-cpp-turboquant (TurboQuant フォーク) を
+# CUDA(sm_120) + HIP(gfx906) + Vulkan の3バックエンド同時ビルド
+#
+# 上流版との違いは KV cache 型 turbo2/turbo3/turbo4 が使えること。
+# turbo3 は約 3.5bit/要素で、q8_0 比でおよそ 1/2.4、f16 比でおよそ 1/4.5 の KV サイズになる。
+# 長コンテキストを VRAM に収めたい場合はこちらを使う。
+#
+# ROCm 7.2.4 ベース。ROCm 7.14 ランタイムに差し替えても prefill は変わらず
+# tg はむしろ不安定化したため、あえて 7.2.4 に留めている (README の計測参照)。
+ARG ROCM_BASE=mixa3607/rocm-gfx906:7.2.4-complete
+FROM ${ROCM_BASE}
+
+ARG LLAMA_SWAP_VERSION=199
+ARG CUDA_ARCH=120
+ARG AMDGPU_TARGET=gfx906
+
+# CUDA 13.3 toolkit (Blackwell sm_120 用)
+RUN apt-get update && apt-get install -y --no-install-recommends wget gnupg2 ca-certificates && \
+    wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb && \
+    dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb && \
+    apt-get update && apt-get install -y --no-install-recommends cuda-toolkit-13-3 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CUDA_HOME=/usr/local/cuda-13.3
+ENV ROCM_PATH=/opt/rocm
+ENV PATH=${CUDA_HOME}/bin:${ROCM_PATH}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${ROCM_PATH}/lib:${LD_LIBRARY_PATH}
+ENV HSA_OVERRIDE_GFX_VERSION=9.0.6
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git cmake build-essential ninja-build libcurl4-openssl-dev \
+    libvulkan-dev glslc glslang-tools spirv-headers spirv-tools \
+    mesa-vulkan-drivers \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG TURBOQUANT_TAG=b10269-1.5.1
+
+WORKDIR /build
+RUN git clone --depth 1 --branch ${TURBOQUANT_TAG} \
+    https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant.git .
+
+RUN cmake -B build \
+      -DBUILD_SHARED_LIBS=ON \
+      -DGGML_BACKEND_DL=ON \
+      -DGGML_NATIVE=OFF \
+      -DGGML_CPU_ALL_VARIANTS=ON \
+      -DGGML_CUDA=ON \
+      -DGGML_CUDA_NO_MXFP4=ON \
+      -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
+      -DGGML_HIP=ON \
+      -DAMDGPU_TARGETS=${AMDGPU_TARGET} \
+      -DCMAKE_HIP_FLAGS="-mllvm -amdgpu-sched-strategy=max-ilp" \
+      -DGGML_VULKAN=ON \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DLLAMA_CURL=ON \
+      -DLLAMA_BUILD_TESTS=OFF \
+      -DLLAMA_BUILD_UI=OFF \
+      -DLLAMA_USE_PREBUILT_UI=OFF \
+      -G Ninja && \
+    cmake --build build --parallel $(nproc)
+
+RUN mkdir -p /app && \
+    find build/bin -maxdepth 1 -type f -executable -exec cp {} /app/ \; && \
+    find build/bin -name "*.so*" -exec cp -P {} /app/ \;
+
+# llama-swap をリリースから取得 (ビルドコンテキストに依存しない)
+RUN wget -qO /tmp/llama-swap.tar.gz \
+        https://github.com/mostlygeek/llama-swap/releases/download/v${LLAMA_SWAP_VERSION}/llama-swap_${LLAMA_SWAP_VERSION}_linux_amd64.tar.gz && \
+    tar xzf /tmp/llama-swap.tar.gz -C /tmp llama-swap && \
+    install -m 0755 /tmp/llama-swap /app/llama-swap && \
+    rm -f /tmp/llama-swap.tar.gz /tmp/llama-swap
+
+ENV LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH}
+WORKDIR /app
+EXPOSE 8080
+
+ENTRYPOINT ["/app/llama-swap"]
+CMD ["-config", "/app/config.yaml", "-listen", "0.0.0.0:8080"]
