@@ -9,62 +9,80 @@ on:
       dockerfile:
         description: どちらをビルドするか
         type: choice
-        options: [Dockerfile.upstream, Dockerfile.turboquant]
+        options:
+          - Dockerfile.upstream
+          - Dockerfile.turboquant
         default: Dockerfile.upstream
 
 jobs:
-  # GitHub ホストランナーでは完走しない (ディスクも時間も足りない) ので、
-  # push 時は構文と参照先の妥当性だけを検証する。
+  # GitHub ホストランナーは空き14GB程度 / 実行6時間上限なので、
+  # 15GB超のイメージをここでビルドしきることはできない。
+  # push 時は「構文」と「参照先が実在するか」だけを検証する。
   validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Dockerfile の構文チェック
+      - name: hadolint (Dockerfile.upstream)
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile.upstream
           failure-threshold: error
 
-      - name: Dockerfile.turboquant の構文チェック
+      - name: hadolint (Dockerfile.turboquant)
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile.turboquant
           failure-threshold: error
 
-      - name: 参照している上流タグとベースイメージが実在するか
+      - name: 参照している上流タグ / リリースが実在するか
         run: |
           set -euo pipefail
+
+          arg_default() {
+            sed -n "s/^ARG $2=//p" "$1" | head -n1
+          }
+
           check_tag() {
-            local repo="$1" tag="$2"
-            if git ls-remote --exit-code --tags "https://github.com/${repo}.git" "refs/tags/${tag}" >/dev/null; then
-              echo "ok: ${repo}@${tag}"
+            if git ls-remote --exit-code --tags \
+                 "https://github.com/$1.git" "refs/tags/$2" >/dev/null; then
+              echo "ok:      $1@$2"
             else
-              echo "missing: ${repo}@${tag}"; exit 1
+              echo "MISSING: $1@$2"
+              exit 1
             fi
           }
+
           check_tag ggml-org/llama.cpp \
-            "$(grep -oP ARG LLAMACPP_TAG=KS+ Dockerfile.upstream)"
+            "$(arg_default Dockerfile.upstream LLAMACPP_TAG)"
           check_tag AtomicBot-ai/atomic-llama-cpp-turboquant \
-            "$(grep -oP ARG TURBOQUANT_TAG=KS+ Dockerfile.turboquant)"
+            "$(arg_default Dockerfile.turboquant TURBOQUANT_TAG)"
 
-          lsv="$(grep -oP ARG LLAMA_SWAP_VERSION=KS+ Dockerfile.upstream)"
-          curl -sfI -o /dev/null -L \
-            "https://github.com/mostlygeek/llama-swap/releases/download/v${lsv}/llama-swap_${lsv}_linux_amd64.tar.gz" \
-            && echo "ok: llama-swap v${lsv}"
+          lsv="$(arg_default Dockerfile.upstream LLAMA_SWAP_VERSION)"
+          url="https://github.com/mostlygeek/llama-swap/releases/download"
+          url="${url}/v${lsv}/llama-swap_${lsv}_linux_amd64.tar.gz"
+          if curl -sfI -o /dev/null -L "$url"; then
+            echo "ok:      llama-swap v${lsv}"
+          else
+            echo "MISSING: llama-swap v${lsv}"
+            exit 1
+          fi
 
-  # 実ビルドはセルフホストランナー向け。ラベル self-hosted を付けたランナーが
-  # 無いリポジトリでは起動しないので、明示的に実行したときだけ動かす。
+  # 実ビルドは self-hosted ランナー (GPU 不要 / ディスク 80GB 程度と数時間) 向け。
+  # ラベル self-hosted のランナーが無いリポジトリでは queue に残るだけなので、
+  # 手動起動 (workflow_dispatch) のときだけ動かす。
   build:
-    if: github.event_name == workflow_dispatch
+    if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
 
-      - name: ビルド
+      - name: docker build
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
         run: |
           set -euo pipefail
-          df="${{ inputs.dockerfile }}"
-          tag="llama-swap-$(basename "$df" | sed s/^Dockerfile.//):ci-${GITHUB_SHA::7}"
-          docker build -t "$tag" -f "$df" .
+          variant="${DOCKERFILE#Dockerfile.}"
+          tag="llama-swap-${variant}:ci-${GITHUB_SHA:0:7}"
+          docker build -t "$tag" -f "$DOCKERFILE" .
           docker images "$tag"
