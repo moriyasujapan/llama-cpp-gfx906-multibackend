@@ -1,0 +1,92 @@
+# beellama.cpp を CUDA + Vulkan の2バックエンドでビルド (AMD なし構成用)
+#
+# Dockerfile.upstream / Dockerfile.turboquant は gfx906 との同居が目的で
+# ROCm ベースイメージを使うが、AMD を挿していない構成では ROCm 一式が丸ごと無駄。
+# こちらは素の Ubuntu + CUDA toolkit から積むので、イメージが大幅に小さくなる。
+#
+# beellama.cpp (Anbeeld/beellama.cpp) を選ぶ理由:
+#   - KVarN (variance-normalized KV量子化) + precision tail。
+#     K/V を独立したビット幅にでき、直近 N トークンだけ F16/BF16 で残せる。
+#     TurboQuant の turbo2/3/4 の代替。
+#   - Qwen3.8-Flash-Next (qwen4exp) を取り込み済み。
+#     上流の PR #27742 は未マージなので、上流タグからは同モデルを動かせない。
+ARG CUDA_BASE=ubuntu:24.04
+FROM ${CUDA_BASE}
+
+ARG LLAMA_SWAP_VERSION=199
+
+# CMP 170HX = GA100 なので sm_80、RTX 5060 Ti = Blackwell なので sm_120。
+# 片方だけにするとそのカードでカーネルが無く使えないので両方入れる。
+ARG CUDA_ARCH="80;120"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# CUDA 13.3 toolkit
+RUN apt-get update && apt-get install -y --no-install-recommends wget gnupg2 ca-certificates && \
+    wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb && \
+    dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb && \
+    apt-get update && apt-get install -y --no-install-recommends cuda-toolkit-13-3 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CUDA_HOME=/usr/local/cuda-13.3
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+
+# Vulkan は NVIDIA ドライバの ICD をホストから注入してもらう。
+# mesa-vulkan-drivers は AMD/Intel/ソフトウェア用なので入れない。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git cmake build-essential ninja-build libcurl4-openssl-dev \
+    libvulkan-dev libvulkan1 vulkan-tools glslc glslang-tools \
+    spirv-headers spirv-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG BEELLAMA_TAG=preview-v0.4.5
+
+WORKDIR /build
+RUN git clone --depth 1 --branch ${BEELLAMA_TAG} \
+    https://github.com/Anbeeld/beellama.cpp.git .
+
+# GGML_CUDA_FA は KVarN の FlashAttention 経路に必要。
+# 既定でも標準50ペア + KVarN15ペアをコンパイルするのでビルドは長い。
+RUN cmake -B build \
+      -DBUILD_SHARED_LIBS=ON \
+      -DGGML_BACKEND_DL=ON \
+      -DGGML_NATIVE=OFF \
+      -DGGML_CPU_ALL_VARIANTS=ON \
+      -DGGML_CUDA=ON \
+      -DGGML_CUDA_FA=ON \
+      -DGGML_CUDA_NO_MXFP4=ON \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
+      -DGGML_VULKAN=ON \
+      -DGGML_RPC=ON \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DLLAMA_CURL=ON \
+      -DLLAMA_BUILD_TESTS=OFF \
+      -DLLAMA_BUILD_UI=OFF \
+      -DLLAMA_USE_PREBUILT_UI=OFF \
+      -G Ninja && \
+    cmake --build build --parallel $(nproc)
+
+RUN mkdir -p /app && \
+    find build/bin -maxdepth 1 -type f -executable -exec cp {} /app/ \; && \
+    find build/bin -name "*.so*" -exec cp -P {} /app/ \;
+
+# llama-swap をリリースから取得 (ビルドコンテキストに依存しない)
+RUN wget -qO /tmp/llama-swap.tar.gz \
+        https://github.com/mostlygeek/llama-swap/releases/download/v${LLAMA_SWAP_VERSION}/llama-swap_${LLAMA_SWAP_VERSION}_linux_amd64.tar.gz && \
+    tar xzf /tmp/llama-swap.tar.gz -C /tmp llama-swap && \
+    install -m 0755 /tmp/llama-swap /app/llama-swap && \
+    rm -f /tmp/llama-swap.tar.gz /tmp/llama-swap
+
+ENV LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH}
+
+# graphics を足さないと NVIDIA の Vulkan ICD が注入されず、Vulkan バックエンドが
+# デバイスを1枚も見つけられない (compute,utility だけでは足りない)。
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+
+WORKDIR /app
+EXPOSE 8080
+
+ENTRYPOINT ["/app/llama-swap"]
+CMD ["-config", "/app/config.yaml", "-listen", "0.0.0.0:8080"]

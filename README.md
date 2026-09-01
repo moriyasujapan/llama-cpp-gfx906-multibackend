@@ -17,12 +17,13 @@ gfx906 対応 ROCm を再ビルドして配布しているが、配布イメー�
 同一プロセスから同時に使えるようにしている。
 後述の計測のとおり、**CUDA と Vulkan を足しても gfx906 の性能は落ちない。**
 
-## 2種類の Dockerfile
+## 3種類の Dockerfile
 
-| | ソース | KV cache turbo2/3/4 | ROCm ベース |
-|---|---|---|---|
-| `Dockerfile.upstream` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) `b10470` | なし | 7.14 (TheRock) |
-| `Dockerfile.turboquant` | [AtomicBot-ai/atomic-llama-cpp-turboquant](https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant) `b10269-1.5.1` | **あり** | 7.2.4 |
+| | ソース | バックエンド | KV cache 量子化 | ベース |
+|---|---|---|---|---|
+| `Dockerfile.upstream` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) `b10470` | CUDA + HIP + Vulkan | 標準のみ | ROCm 7.14 (TheRock) |
+| `Dockerfile.turboquant` | [AtomicBot-ai/atomic-llama-cpp-turboquant](https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant) `b10269-1.5.1` | CUDA + HIP + Vulkan | **turbo2/3/4** | ROCm 7.2.4 |
+| `Dockerfile.beellama` | [Anbeeld/beellama.cpp](https://github.com/Anbeeld/beellama.cpp) `preview-v0.4.5` | CUDA + Vulkan | **KVarN + precision tail** | Ubuntu 24.04 + CUDA 13.3 |
 
 `--spec-type` / `draft-mtp` / `draft-eagle3` / `ngram-*` はどちらでも使える
 (上流に取り込み済み)。フォーク側だけの利点は TurboQuant の KV cache 量子化型で、
@@ -35,15 +36,16 @@ gfx906 対応 ROCm を再ビルドして配布しているが、配布イメー�
 ```sh
 docker build -t llama-swap-upstream:b10470   -f Dockerfile.upstream   .
 docker build -t llama-swap-turboquant:b10269 -f Dockerfile.turboquant .
+docker build -t llama-swap-beellama:v0.4.5   -f Dockerfile.beellama   .
 ```
 
 ビルドコンテキストは使わないので `.` は何でもよい。主な `--build-arg`:
 
 | ARG | 既定 | 用途 |
 |---|---|---|
-| `CUDA_ARCH` | `120` | NVIDIA の compute capability。RTX 50 系は 120 |
+| `CUDA_ARCH` | `120` / `80;120` | NVIDIA の compute capability。RTX 50 系は 120、GA100 (CMP 170HX / A100) は 80。複数指定するときは `--build-arg CUDA_ARCH="80;120"` と引用符で囲む (囲まないと `docker` を叩くシェル側が `;` でコマンドを切る) |
 | `AMDGPU_TARGET` | `gfx906` | AMD のターゲット |
-| `LLAMACPP_TAG` / `TURBOQUANT_TAG` | 上表 | ソースのタグ |
+| `LLAMACPP_TAG` / `TURBOQUANT_TAG` / `BEELLAMA_TAG` | 上表 | ソースのタグ |
 | `LLAMA_SWAP_VERSION` | `199` | llama-swap のリリース版 |
 
 成果物は `Dockerfile.upstream` で約 15GB、`Dockerfile.turboquant` で約 31GB
@@ -113,6 +115,57 @@ ROCm のバージョン自体は gfx906 の llama.cpp 性能にほとんど寄�
 
 なお HIP のコンパイルフラグには mixa3607 の preset と同じ
 `-mllvm -amdgpu-sched-strategy=max-ilp` を入れている (gfx906 の prefill 対策)。
+
+## AMD なし構成 (`Dockerfile.beellama`)
+
+AMD を挿していない構成では、ROCm ベースイメージが丸ごと無駄になる。
+`Dockerfile.beellama` は素の Ubuntu 24.04 + CUDA 13.3 から積み、
+**CUDA + Vulkan の2バックエンド**だけをビルドする。
+
+beellama.cpp を選ぶ理由は2つ。
+
+1. **KVarN。** variance-normalized な KV cache 量子化 (`kvarn2`〜`kvarn8`) に加えて、
+   直近 N トークンだけ F16/BF16 で残す precision tail を持つ。
+   `-ctk` / `-ctv` を独立に指定できるので、V だけ低ビットに倒せる。
+   TurboQuant の `turbo2/3/4` に対する代替で、公称値では
+   KVarN3/KVarN2 + 1024トークン tail が BF16 比 20.7% (median KLD 0.002424)。
+   `turbo3` の f16 比およそ 22% とほぼ同サイズだが、こちらは KLD が公開されている。
+2. **Qwen3.8-Flash-Next (`qwen4exp`) を取り込み済み。**
+   上流の [PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742) は未マージなので、
+   `Dockerfile.upstream` のタグ指定では同モデルを動かせない。
+
+### Vulkan を動かすのに `graphics` capability が要る
+
+NVIDIA の Vulkan ICD は nvidia-container-toolkit がホストから注入するが、
+既定の `compute,utility` では入らず、Vulkan バックエンドがデバイスを1枚も
+見つけられない。Dockerfile 側で
+
+```
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+```
+
+を指定してある。コンテナ内で `vulkaninfo --summary` が GPU を列挙するか確認できる。
+
+### 実行
+
+```sh
+docker run --rm --gpus all \
+  -v /path/to/models:/models:ro -v /path/to/config.yaml:/app/config.yaml \
+  -p 8080:8080 llama-swap-beellama:v0.4.5
+```
+
+`--device /dev/kfd` 等の AMD 向けオプションは不要。
+
+### 未検証
+
+- 配布バイナリ (`ghcr.io/anbeeld/beellama.cpp`) に sm_80 が含まれるかは未確認。
+  含まれているなら CMP 170HX でもビルド不要で済む。自前ビルドはその確認が取れるまでの保険。
+- CMP 170HX の PCIe リンクは Gen1 x4 相当に絞られている。`--split-mode layer` の
+  token generation は毎トークン hidden state しか流れないので耐えるが、
+  モデルロードと prefill は明確に落ちる。`--tensor-split` の配分はそれを見込むこと。
+- Vulkan を積んでいるので、下記「計測時の落とし穴 1」がこの構成でも当てはまる。
+  CUDA と Vulkan の両方から同じ GPU が見えるため、`--device CUDA0,CUDA1,CUDA2` の
+  ように明示しないとレイヤーがバックエンドを跨いで分散する。
 
 ## ライセンス
 
