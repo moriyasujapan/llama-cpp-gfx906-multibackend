@@ -134,6 +134,17 @@ beellama.cpp を選ぶ理由は2つ。
    上流の [PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742) は未マージなので、
    `Dockerfile.upstream` のタグ指定では同モデルを動かせない。
 
+### 依存パッケージが既存2つと違う
+
+上流は HTTP クライアントを curl から cpp-httplib + OpenSSL に移しており、
+`preview-v0.4.5` のツリーには `find_package(CURL)` も `curl/curl.h` も残っていない
+(`LLAMA_CURL` は `llama_option_depr` 行きで、渡しても無視される)。
+そのため `libcurl4-openssl-dev` ではなく **`libssl-dev`** を入れている。
+これが無いと configure が `OpenSSL not found, HTTPS support disabled` と警告し、
+ビルドは通るが `-hf` / `--model-url` での HTTPS 取得が無効になる。
+
+`GGML_CUDA_NO_MXFP4` もこのツリーには存在しないので指定していない。
+
 ### Vulkan を動かすのに `graphics` capability が要る
 
 NVIDIA の Vulkan ICD は nvidia-container-toolkit がホストから注入するが、
@@ -156,8 +167,58 @@ docker run --rm --gpus all \
 
 `--device /dev/kfd` 等の AMD 向けオプションは不要。
 
+### Qwen3.8-Flash-Next の 51B テーブルの置き場所
+
+以下は `preview-v0.4.5` (`476aa6c`) のソースを読んで確認した内容。
+
+51B の N-gram テーブルのテンソル名は **`per_layer_token_embd`** (`src/llama-arch.cpp:548`)。
+`ple_key` / `ple_value` 等の `blk.N.ple_*` はどれも小さい射影行列で、別物。
+
+そして通常は手で配置指定する必要がない。beellama はこのテンソルを
+`TENSOR_READ_LAZY` 付きで確保し (`src/models/qwen4exp.cpp`)、mmap 経由で
+必要な行だけをディスクから読む。制御は `--tensor-read-lazy`:
+
+| 値 | 挙動 |
+|---|---|
+| `auto` (既定) | 4 GiB を超えるテンソルにだけ on |
+| `on` | 常に on (mmap 必須) |
+| `off` | 常駐させる |
+
+51B テーブルは当然 4 GiB を超えるので、**既定のまま on になる**。
+RAM は常駐先ではなくページキャッシュとして効く。
+
+明示的に RAM 常駐にしたい場合だけ、
+
+```
+--tensor-read-lazy off -ot "per_layer_token_embd=CPU"
+```
+
+`-ot` の正規表現がどのテンソルにもマッチしなかった場合は黙って無視されるので、
+起動ログの `tensor ... buffer type` 行で実際の割り当て先を必ず確認すること。
+
+### KV cache の型
+
+`--cache-type-k` / `--cache-type-v` が受ける型 (`common/arg.cpp`):
+
+- 標準: `f32`, `f16`, `bf16`, `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0`, `q5_1`
+- 低ビット追加分: `q6_0`, `q6_1`, `q3_0`, `q3_1`, `q2_0`, `q2_1`
+- KVarN 擬似型: `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, `kvarn8`
+
+precision tail は `--kv-tail-tokens` (数値 / `auto` / 位置指定リスト) と
+`--kv-tail-type` (`f16` または `bf16`)。SWA レイヤーだけ別扱いにするなら
+`--cache-type-k-swa` / `--cache-type-v-swa`。
+
+`Dockerfile.turboquant` からの移行について: **`turbo2` / `turbo3` / `turbo4` は
+beellama でもそのまま受け付ける**が、v0.4.0 で削除済みとして
+`q2_0` / `q3_0` / `q4_0` に読み替えられ、警告が出る (`common/arg.cpp`)。
+KVarN を使いたいなら明示的に `kvarn3` 等へ書き換えること。
+
 ### 未検証
 
+- **docker build 自体は未実行。** 検証環境から Docker Hub の blob CDN に到達できず、
+  ベースイメージを pull できなかった。ソースの clone、CMake オプションの実在確認、
+  CPU バックエンドでの `cmake` configure (exit 0、未使用変数なし) までは通してある。
+  apt のパッケージ名、CUDA toolkit のインストール、CUDA/Vulkan の実コンパイルは未検証。
 - 配布バイナリ (`ghcr.io/anbeeld/beellama.cpp`) に sm_80 が含まれるかは未確認。
   含まれているなら CMP 170HX でもビルド不要で済む。自前ビルドはその確認が取れるまでの保険。
 - CMP 170HX の PCIe リンクは Gen1 x4 相当に絞られている。`--split-mode layer` の

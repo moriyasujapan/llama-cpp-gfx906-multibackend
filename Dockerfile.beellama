@@ -35,7 +35,7 @@ ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 # Vulkan は NVIDIA ドライバの ICD をホストから注入してもらう。
 # mesa-vulkan-drivers は AMD/Intel/ソフトウェア用なので入れない。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git cmake build-essential ninja-build libcurl4-openssl-dev \
+    git cmake build-essential ninja-build libssl-dev \
     libvulkan-dev libvulkan1 vulkan-tools glslc glslang-tools \
     spirv-headers spirv-tools \
     && rm -rf /var/lib/apt/lists/*
@@ -55,12 +55,10 @@ RUN cmake -B build \
       -DGGML_CPU_ALL_VARIANTS=ON \
       -DGGML_CUDA=ON \
       -DGGML_CUDA_FA=ON \
-      -DGGML_CUDA_NO_MXFP4=ON \
       -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
       -DGGML_VULKAN=ON \
       -DGGML_RPC=ON \
       -DCMAKE_BUILD_TYPE=Release \
-      -DLLAMA_CURL=ON \
       -DLLAMA_BUILD_TESTS=OFF \
       -DLLAMA_BUILD_UI=OFF \
       -DLLAMA_USE_PREBUILT_UI=OFF \
