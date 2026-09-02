@@ -209,15 +209,87 @@ precision tail は `--kv-tail-tokens` (数値 / `auto` / 位置指定リスト) 
 `--cache-type-k-swa` / `--cache-type-v-swa`。
 
 `Dockerfile.turboquant` からの移行について: **`turbo2` / `turbo3` / `turbo4` は
-beellama でもそのまま受け付ける**が、v0.4.0 で削除済みとして
-`q2_0` / `q3_0` / `q4_0` に読み替えられ、警告が出る (`common/arg.cpp`)。
-KVarN を使いたいなら明示的に `kvarn3` 等へ書き換えること。
+beellama でもそのまま受け付ける**。v0.4.0 で削除済みとして扱われ、通常の
+context では `kvarn2` / `kvarn3` / `kvarn4` に読み替えられて警告が出る
+(`common/arg.cpp` の `parse_target_cache_type`)。実測ログ:
+
+```
+W cache type 'turbo3' was removed in v0.4.0; redirecting to 'kvarn3'
+```
+
+`--cache-type-k-draft` 等の draft context 側だけは KVarN を持たないので
+`q2_0` / `q3_0` / `q4_0` にフォールバックする (同ファイル `kv_cache_type_from_str`)。
+
+### 実測 (CPU バックエンド、ランダム重みの合成モデル)
+
+GPU の無い検証環境 (4 vCPU / 15 GB RAM) で、`preview-v0.4.5` を CPU バックエンドだけ
+ビルドして測った。モデルは gguf-py で生成したランダム重み。**品質は測れない**が、
+メモリと処理経路の挙動は本物と同じ。
+
+#### `--tensor-read-lazy` は本当に効く
+
+gemma4 アーキ (qwen4exp と同じ `TENSOR_READ_LAZY` 経路) で、
+`per_layer_token_embd` を F16 で 1.0 GiB / 4.25 GiB にした合成モデル。
+`llama-bench -p 32 -n 16`、peak RSS は `/proc/<pid>/status` の `VmHWM`。
+
+| テーブル | `--tensor-read-lazy` | peak RSS | tg16 t/s |
+|---|---|---:|---:|
+| 1.0 GiB | `off` | 1097 MiB | 291.3 |
+| 1.0 GiB | `on` | **79 MiB** | 277.2 |
+| 4.25 GiB | `off` | 4494 MiB | 138.8 |
+| 4.25 GiB | `auto` (既定) | **147 MiB** | 136.5 |
+| 4.25 GiB | `on` | 148 MiB | 136.1 |
+
+- 4 GiB を超えると `auto` が `on` と同じ挙動になる (ソースの記述どおり)。
+- RSS は 30 分の 1、tg の低下は 2〜5%。
+- 1.0 GiB では `auto` は `off` 側に倒れるので、小さいテーブルを lazy にしたいなら明示 `on`。
+
+#### KV cache のサイズ (c=32768、4層、head_dim=128、KV ヘッド 4)
+
+llama アーキの合成モデル。`-v` ログの本番割り当て行から (`common_fit_params` の
+no_alloc 試走では KVarN が 0.00 MiB と出るので、最後の行を読むこと)。
+
+| `-ctk`/`-ctv` | KV cache | f16 比 | compute buffer |
+|---|---:|---:|---:|
+| `f16` | 256.00 MiB | 100% | 41 MiB |
+| `q8_0` | 136.00 MiB | 53% | 41 MiB |
+| `q4_0` | 72.00 MiB | 28% | 41 MiB |
+| `q3_0` | 56.00 MiB | 22% | — |
+| `q2_0` | 40.00 MiB | 16% | — |
+| `kvarn4` | 74.01 MiB + tail 1.01 | 29% | **1000 MiB** |
+| `kvarn3` | 58.01 MiB + tail 1.01 | 23% | **1000 MiB** |
+| `kvarn2` | 42.01 MiB + tail 1.01 | 16% | **1000 MiB** |
+
+- **KVarN のサイズは同ビットの `qN_0` とほぼ同じ** (差はスケールのメタデータ約 2 MiB)。
+  KVarN の売りはサイズではなく KLD で、そちらはランダム重みでは測れない。
+- 既定の precision tail は 128 トークン (`--kv-tail-tokens` 未指定時)。
+- **CPU の KVarN 経路は compute buffer を 1000 MiB 取る** (f16 の 24 倍)。
+  これは CUDA/WMMA/MFMA の専用経路ではなく portable fallback の挙動。
+
+#### CPU での速度 (同モデル、pp512 / tg128、`-fa 1`)
+
+| `-ctk`/`-ctv` | pp512 t/s | tg128 t/s |
+|---|---:|---:|
+| `f16` | 8467 | 1368 |
+| `q8_0` | 4245 | 1089 |
+| `q4_0` | 3980 | 1013 |
+| `q3_0` | 954 | 807 |
+| `q2_0` | 1470 | 937 |
+| `kvarn4` | **84** | 1476 |
+| `kvarn3` | **79** | 1329 |
+| `kvarn2` | **81** | 1092 |
+
+- **CPU では KVarN の prefill が f16 の 100 分の 1**。tg は f16 と同等かむしろ速い。
+- KVarN は head_dim 128 / 256 / 512 限定 (`KVarN requires 128-, 256-, or 512-dimensional
+  key/value heads`)。64 では context 作成で落ちる。
+- この数字は portable fallback のもの。RTX 5060 Ti / CMP 170HX では CUDA 経路に乗るので
+  別物になるはず。ここで言えるのは「CPU オフロードした層に KVarN を使うな」まで。
 
 ### 未検証
 
 - **docker build 自体は未実行。** 検証環境から Docker Hub の blob CDN に到達できず、
   ベースイメージを pull できなかった。ソースの clone、CMake オプションの実在確認、
-  CPU バックエンドでの `cmake` configure (exit 0、未使用変数なし) までは通してある。
+  CPU バックエンドでのビルドと上記の実測までは通してある。
   apt のパッケージ名、CUDA toolkit のインストール、CUDA/Vulkan の実コンパイルは未検証。
 - 配布バイナリ (`ghcr.io/anbeeld/beellama.cpp`) に sm_80 が含まれるかは未確認。
   含まれているなら CMP 170HX でもビルド不要で済む。自前ビルドはその確認が取れるまでの保険。
